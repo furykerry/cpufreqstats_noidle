@@ -22,7 +22,6 @@
 #include <asm/cputime.h>
 #include <linux/kernel_stat.h>
 
-
 static spinlock_t cpufreq_stats_lock;
 
 #define CPUFREQ_STATDEVICE_ATTR(_name, _mode, _show, _store) \
@@ -36,7 +35,6 @@ struct cpufreq_stats {
 	unsigned int cpu;
 	unsigned int total_trans;
 	unsigned long long  last_time;
-	unsigned long long  last_busy_time;
 	unsigned int max_state;
 	unsigned int state_num;
 	unsigned int last_index;
@@ -76,25 +74,14 @@ static int cpufreq_stats_update(unsigned int cpu)
 	struct cpufreq_stats *stat;
 	unsigned long long cur_time;
 
-	cur_time = get_jiffies_64();
-	cputime64_t cur_busy_time= get_cpu_busy_time(cpu);
-
 	spin_lock(&cpufreq_stats_lock);
+	cur_time = ignore_idle ? get_cpu_busy_time(cpu):get_jiffies_64();
 	stat = per_cpu(cpufreq_stats_table, cpu);
-
-	if (stat->time_in_state){
-		if(ignore_idle){
-			stat->time_in_state[stat->last_index] =
-				cputime64_add(stat->time_in_state[stat->last_index],
-				      cputime_sub(cur_busy_time, stat->last_busy_time));
-		}else{
-			stat->time_in_state[stat->last_index] =
-				cputime64_add(stat->time_in_state[stat->last_index],
+	if (stat->time_in_state)
+		stat->time_in_state[stat->last_index] =
+			cputime64_add(stat->time_in_state[stat->last_index],
 				      cputime_sub(cur_time, stat->last_time));
-		}
-	}
 	stat->last_time = cur_time;
-	stat->last_busy_time=cur_busy_time;
 	spin_unlock(&cpufreq_stats_lock);
 	return 0;
 }
@@ -177,7 +164,14 @@ static ssize_t store_ignore_idle(struct cpufreq_policy *policy, char *buf)
 	if (sscanf(buf, "%d", &input) != 1)
 		return -EINVAL;
 
-	ignore_idle = input;
+	if(ignore_idle!=input){
+		struct cpufreq_stats *stat = per_cpu(cpufreq_stats_table, policy->cpu);
+		spin_lock(&cpufreq_stats_lock);
+		ignore_idle = input;
+		stat->last_time=ignore_idle ? get_cpu_busy_time( policy->cpu):get_jiffies_64();
+		spin_unlock(&cpufreq_stats_lock);
+	}
+
 	return 1;
 }
 
@@ -185,6 +179,7 @@ static ssize_t show_ignore_idle(struct cpufreq_policy *policy, char *buf)
 {
 	return sprintf(buf, "%d\n", ignore_idle);
 }
+
 
 
 CPUFREQ_STATDEVICE_ATTR(total_trans, 0444, show_total_trans, NULL);
@@ -202,7 +197,7 @@ static struct attribute *default_attrs[] = {
 };
 static struct attribute_group stats_attr_group = {
 	.attrs = default_attrs,
-	.name = "stats2"
+	.name = "stats"
 };
 
 static int freq_table_get_index(struct cpufreq_stats *stat, unsigned int freq)
@@ -289,9 +284,8 @@ static int cpufreq_stats_create_table(struct cpufreq_policy *policy,
 	}
 	stat->state_num = j;
 	spin_lock(&cpufreq_stats_lock);
-	stat->last_time = get_jiffies_64();
+	stat->last_time=ignore_idle ? get_cpu_busy_time(cpu):get_jiffies_64();;
 	stat->last_index = freq_table_get_index(stat, policy->cur);
-	stat->last_busy_time = get_cpu_busy_time(cpu);
 	spin_unlock(&cpufreq_stats_lock);
 	cpufreq_cpu_put(data);
 	return 0;
@@ -355,7 +349,6 @@ static int cpufreq_stat_notifier_trans(struct notifier_block *nb,
 	return 0;
 }
 
-
 static int __cpuinit cpufreq_stat_cpu_callback(struct notifier_block *nfb,
 					       unsigned long action,
 					       void *hcpu)
@@ -396,14 +389,11 @@ static int __init cpufreq_stats_init(void)
 	spin_lock_init(&cpufreq_stats_lock);
 	ret = cpufreq_register_notifier(&notifier_policy_block,
 				CPUFREQ_POLICY_NOTIFIER);
-	printk(KERN_ALERT "cpufreq_register_notifier policy return %d",ret);
 	if (ret)
 		return ret;
 
 	ret = cpufreq_register_notifier(&notifier_trans_block,
 				CPUFREQ_TRANSITION_NOTIFIER);
-	printk(KERN_ALERT "cpufreq_register_notifier transition return %d",ret);
-
 	if (ret) {
 		cpufreq_unregister_notifier(&notifier_policy_block,
 				CPUFREQ_POLICY_NOTIFIER);
